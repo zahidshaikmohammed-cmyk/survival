@@ -60,7 +60,6 @@ class Features:
     noise: float
     liquidity_quality: float
     market_alignment: float
-    sector_alignment: float
     setup: str
     reasons: list[str]
     rejection_reasons: list[str]
