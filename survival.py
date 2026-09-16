@@ -10,11 +10,24 @@ from survival_engine.engine import run_once
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="PSYGRID SURVIVAL — 11:01 450-stock decision engine")
-    parser.add_argument("--test-now", action="store_true", help="run immediately; useful for local smoke tests")
-    parser.add_argument("--log-level", default="INFO", choices=("DEBUG", "INFO", "WARNING", "ERROR"))
+    parser = argparse.ArgumentParser(
+        description="PSYGRID SURVIVAL — latest available market-state decision engine"
+    )
+    parser.add_argument(
+        "--test-now",
+        action="store_true",
+        help="kept for CLI compatibility; execution already uses the latest available upstream state",
+    )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+    )
     args = parser.parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
     try:
         return run_once(Config(), allow_before_decision=args.test_now)
     except KeyboardInterrupt:
