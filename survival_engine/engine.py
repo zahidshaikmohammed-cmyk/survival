@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from datetime import datetime
 from typing import Any
 
@@ -15,57 +14,57 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 
-def wait_until_decision(config: Config) -> datetime:
-    now = now_ist()
-    target = datetime.combine(now.date(), config.decision_time, tzinfo=IST)
-    if now < target:
-        seconds = (target - now).total_seconds()
-        print(f"SURVIVAL armed. Waiting {seconds:.0f}s until {target.strftime('%H:%M:%S')} IST...")
-        time.sleep(seconds)
-        now = now_ist()
-    return now
-
-
-def _cutoff_for_day(now: datetime, config: Config) -> datetime:
-    return datetime.combine(now.date(), config.data_cutoff_time, tzinfo=IST)
-
-
 def run_once(config: Config, allow_before_decision: bool = False) -> int:
-    decision_now = now_ist() if allow_before_decision else wait_until_decision(config)
-    cutoff = _cutoff_for_day(decision_now, config)
+    """Run SURVIVAL against the newest market state available right now.
 
-    print("\n[1/4] FETCHING PSYGRID: 10 STOCK SHARDS + INDEX CONTEXT...")
+    There is intentionally no 11:00/11:01 timestamp gate. The upstream
+    PSYGRID snapshot is authoritative; whatever the newest candles are when
+    fetched become the strategy state used for the signal.
+    """
+    decision_now = now_ist()
+
+    print("\n[1/4] FETCHING LATEST PSYGRID: 10 STOCK SHARDS + INDEX CONTEXT...")
     stock_results, index_results = fetch_endpoints(config)
 
-    print("[2/4] BUILDING THE 450-STOCK STRATEGY UNIVERSE...")
-    # Upstream acquisition is authoritative by design. No stale-data,
-    # malformed-data, shard-count, duplicate, or completeness gate lives here.
-    stocks, indices = assemble_universe(stock_results, index_results, cutoff)
+    print("[2/4] BUILDING THE LATEST AVAILABLE STRATEGY UNIVERSE...")
+    # cutoff=None is deliberate: never discard a newer candle because of a
+    # configured clock. No data-quality gate is introduced here.
+    stocks, indices = assemble_universe(stock_results, index_results, None)
+
+    latest_stock_ts = max(
+        (c.ts for stock in stocks for c in stock.candles),
+        default=None,
+    )
+    latest_index_ts = max(
+        (c.ts for series in indices.values() for c in series.candles),
+        default=None,
+    )
 
     print(f"    STOCKS RECEIVED: {len(stocks)}")
+    print(f"    LATEST STOCK CANDLE: {latest_stock_ts.isoformat() if latest_stock_ts else 'N/A'}")
     print(f"    INDEX SERIES AVAILABLE: {len(indices)}")
-    print("[3/4] RUNNING STRATEGY ACROSS THE ENTIRE UNIVERSE...")
-    candidates = score_universe(stocks, indices, config)
+    print(f"    LATEST INDEX CANDLE: {latest_index_ts.isoformat() if latest_index_ts else 'N/A'}")
 
-    # Strategy is responsible for ranking. We do not abort merely because a
-    # candidate score is below a threshold; the selector chooses the three
-    # strongest opportunities produced by the model.
+    print("[3/4] RUNNING SURVIVAL ACROSS THE ENTIRE AVAILABLE UNIVERSE...")
+    candidates = score_universe(stocks, indices, config)
     selected = select_top3(candidates, stocks, config)
 
     metadata: dict[str, Any] = {
         "decision_time": decision_now.isoformat(),
-        "data_cutoff": cutoff.isoformat(),
+        "data_cutoff": None,
+        "latest_stock_candle": latest_stock_ts.isoformat() if latest_stock_ts else None,
+        "latest_index_candle": latest_index_ts.isoformat() if latest_index_ts else None,
         "received_stock_records": len(stocks),
         "index_context_available": sorted(indices),
         "candidate_count": len(candidates),
         "final_count": len(selected),
         "stock_endpoints": 10,
         "hard_exit": "13:15 IST",
-        "engine_mode": "STRATEGY_ONLY",
+        "engine_mode": "LATEST_AVAILABLE_DATA",
         "data_quality_layer": "UPSTREAM_AUTHORITY",
     }
 
-    print("[4/4] FINAL 3-STOCK EXECUTION PLAN")
+    print("[4/4] SURVIVAL SIGNAL — TOP 3")
     print_report(selected, metadata)
     json_path, latest_path = write_report(selected, metadata, config.output_dir)
     print(f"Saved: {json_path}")
