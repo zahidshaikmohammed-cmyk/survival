@@ -28,31 +28,77 @@ class FetchResult:
 
 
 def _request_json(name: str, url: str, timeout: float, retries: int) -> FetchResult:
+    """Fetch one authoritative PSYGRID endpoint.
+
+    SURVIVAL assumes the upstream acquisition layer is authoritative. This
+    function therefore does transport/JSON decoding only; it does not make
+    trading decisions and does not apply data-quality gates.
+    """
     started = time.perf_counter()
     last_error = "unknown error"
     for attempt in range(retries + 1):
         try:
-            req = Request(url, headers={"Accept": "application/json", "Cache-Control": "no-cache, no-store", "User-Agent": "PSYGRID-SURVIVAL/1.0"})
+            req = Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache, no-store",
+                    "User-Agent": "PSYGRID-SURVIVAL/1.0",
+                },
+            )
             with urlopen(req, timeout=timeout) as response:
                 status = getattr(response, "status", 200)
                 raw = response.read()
             payload = json.loads(raw.decode("utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("endpoint JSON root is not an object")
-            return FetchResult(name, url, payload, None, (time.perf_counter() - started) * 1000, status)
+            return FetchResult(
+                name,
+                url,
+                payload,
+                None,
+                (time.perf_counter() - started) * 1000,
+                status,
+            )
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt < retries:
                 time.sleep(0.25 * (attempt + 1))
-    return FetchResult(name, url, None, last_error, (time.perf_counter() - started) * 1000, None)
+    return FetchResult(
+        name,
+        url,
+        None,
+        last_error,
+        (time.perf_counter() - started) * 1000,
+        None,
+    )
 
 
 def fetch_endpoints(config: Config) -> tuple[dict[str, FetchResult], dict[str, FetchResult]]:
+    """Fetch the ten stock shards and all configured index/context endpoints."""
     stock_results: dict[str, FetchResult] = {}
     index_results: dict[str, FetchResult] = {}
     with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
-        futures = {pool.submit(_request_json, name, url, config.request_timeout_seconds, config.request_retries): ("stock", name) for name, url in STOCK_ENDPOINTS.items()}
-        futures.update({pool.submit(_request_json, name, url, config.request_timeout_seconds, config.request_retries): ("index", name) for name, url in INDEX_ENDPOINTS.items()})
+        futures = {
+            pool.submit(
+                _request_json,
+                name,
+                url,
+                config.request_timeout_seconds,
+                config.request_retries,
+            ): ("stock", name)
+            for name, url in STOCK_ENDPOINTS.items()
+        }
+        futures.update(
+            {
+                pool.submit(
+                    _request_json,
+                    name,
+                    url,
+                    config.request_timeout_seconds,
+                    config.request_retries,
+                ): ("index", name)
+                for name, url in INDEX_ENDPOINTS.items()
+            }
+        )
         for future in as_completed(futures):
             kind, name = futures[future]
             result = future.result()
@@ -102,87 +148,67 @@ def _extract_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def parse_candles(rows: list[dict[str, Any]]) -> list[Candle]:
+    """Parse upstream candles without stale/quality/trading gates."""
     candles: list[Candle] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         try:
-            candles.append(Candle(ts=_parse_ts(row.get("timestamp", row.get("ts", row.get("time")))), open=_num(row, "open", "o"), high=_num(row, "high", "h"), low=_num(row, "low", "l"), close=_num(row, "close", "c"), volume=_num(row, "volume", "v")))
+            candles.append(
+                Candle(
+                    ts=_parse_ts(row.get("timestamp", row.get("ts", row.get("time")))),
+                    open=_num(row, "open", "o"),
+                    high=_num(row, "high", "h"),
+                    low=_num(row, "low", "l"),
+                    close=_num(row, "close", "c"),
+                    volume=_num(row, "volume", "v"),
+                )
+            )
         except (ValueError, TypeError, KeyError):
             continue
     candles.sort(key=lambda c: c.ts)
     return candles
 
 
-def validate_candles(candles: list[Candle], cutoff: datetime, min_bars: int) -> tuple[bool, str]:
-    if len(candles) < min_bars:
-        return False, f"only {len(candles)} valid candles"
-    seen: set[datetime] = set()
-    prev: datetime | None = None
-    for c in candles:
-        if c.ts > cutoff:
-            continue
-        if c.ts in seen:
-            return False, "duplicate candle timestamp"
-        seen.add(c.ts)
-        if prev is not None and c.ts <= prev:
-            return False, "non-increasing timestamps"
-        prev = c.ts
-        if c.low > c.high or c.low > c.open or c.low > c.close or c.high < c.open or c.high < c.close:
-            return False, "impossible OHLC"
-        if c.volume < 0:
-            return False, "negative volume"
-        if min(c.open, c.high, c.low, c.close) <= 0:
-            return False, "non-positive price"
-    return True, "ok"
+def parse_stock_payload(
+    result: FetchResult,
+    cutoff: datetime,
+) -> list[Stock]:
+    """Turn one live shard into Stock objects.
 
-
-def parse_stock_payload(result: FetchResult, config: Config, cutoff: datetime) -> tuple[list[Stock], list[str]]:
+    No shard-count gate, no stale gate, no minimum-bar gate and no OHLC gate
+    are applied here. The upstream PSYGRID acquisition layer is authoritative;
+    SURVIVAL's job starts after ingestion.
+    """
     if result.payload is None:
-        return [], [f"{result.name}: {result.error or 'no payload'}"]
-    p = result.payload
-    stocks_obj = p.get("stocks")
+        return []
+
+    stocks_obj = result.payload.get("stocks", {})
     if not isinstance(stocks_obj, dict):
-        return [], [f"{result.name}: missing stocks object"]
-    if p.get("service") not in (None, "PSYGRID"):
-        return [], [f"{result.name}: unexpected service={p.get('service')!r}"]
-    if p.get("status") not in (None, "OK"):
-        return [], [f"{result.name}: endpoint status={p.get('status')!r}"]
-    declared = p.get("stock_count")
-    if declared is not None and int(declared) != config.expected_stocks_per_shard:
-        return [], [f"{result.name}: declared stock_count={declared}, expected {config.expected_stocks_per_shard}"]
-    if len(stocks_obj) != config.expected_stocks_per_shard:
-        return [], [f"{result.name}: actual stock count={len(stocks_obj)}, expected {config.expected_stocks_per_shard}"]
+        return []
+
     out: list[Stock] = []
-    errors: list[str] = []
     for symbol, item in stocks_obj.items():
         if not isinstance(item, dict):
-            errors.append(f"{result.name}/{symbol}: item is not object")
             continue
         try:
             candles = [c for c in parse_candles(_extract_rows(item)) if c.ts <= cutoff]
-            ok, why = validate_candles(candles, cutoff, config.min_bars)
-            if not ok:
-                errors.append(f"{result.name}/{symbol}: {why}")
-                continue
-            if not candles:
-                errors.append(f"{result.name}/{symbol}: no candles through cutoff")
-                continue
-            stale_minutes = (cutoff - candles[-1].ts).total_seconds() / 60.0
-            if stale_minutes < 0 or stale_minutes > config.max_staleness_minutes:
-                errors.append(f"{result.name}/{symbol}: stale by {stale_minutes:.1f} minutes")
-                continue
             previous_close = float(item.get("previous_close"))
             today_open = float(item.get("today_open"))
             security_id = str(item.get("security_id", ""))
-            if not security_id:
-                raise ValueError("missing security_id")
-            if previous_close <= 0 or today_open <= 0:
-                raise ValueError("invalid previous_close/today_open")
-            out.append(Stock(str(item.get("symbol", symbol)), security_id, previous_close, today_open, candles, result.name))
-        except (TypeError, ValueError) as exc:
-            errors.append(f"{result.name}/{symbol}: {exc}")
-    return out, errors
+            out.append(
+                Stock(
+                    str(item.get("symbol", symbol)),
+                    security_id,
+                    previous_close,
+                    today_open,
+                    candles,
+                    result.name,
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    return out
 
 
 def _index_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -207,36 +233,27 @@ def parse_index_payload(result: FetchResult, cutoff: datetime) -> IndexSeries | 
     return IndexSeries(result.name, rows, result.name) if rows else None
 
 
-def assemble_universe(stock_results: dict[str, FetchResult], index_results: dict[str, FetchResult], config: Config, cutoff: datetime) -> tuple[list[Stock], dict[str, IndexSeries], list[str]]:
+def assemble_universe(
+    stock_results: dict[str, FetchResult],
+    index_results: dict[str, FetchResult],
+    cutoff: datetime,
+) -> tuple[list[Stock], dict[str, IndexSeries]]:
+    """Assemble the authoritative universe for the strategy.
+
+    There are deliberately no data-quality gates here. The function does not
+    reject stale candles, reject shard sizes, reject duplicate symbols, reject
+    missing bars, or abort because a data-quality rule was triggered.
+    """
     all_stocks: list[Stock] = []
-    errors: list[str] = []
     for name in sorted(STOCK_ENDPOINTS):
         result = stock_results.get(name)
-        if result is None:
-            errors.append(f"{name}: missing fetch result")
-            continue
-        stocks, errs = parse_stock_payload(result, config, cutoff)
-        all_stocks.extend(stocks)
-        errors.extend(errs)
-
-    by_symbol: dict[str, Stock] = {}
-    duplicate_symbols: set[str] = set()
-    for stock in all_stocks:
-        if stock.symbol in by_symbol:
-            duplicate_symbols.add(stock.symbol)
-        else:
-            by_symbol[stock.symbol] = stock
-    if duplicate_symbols:
-        errors.append("duplicate symbols across shards: " + ", ".join(sorted(duplicate_symbols)[:20]))
-    if len(by_symbol) != config.expected_universe:
-        errors.append(f"validated universe has {len(by_symbol)} unique stocks; expected {config.expected_universe}")
+        if result is not None:
+            all_stocks.extend(parse_stock_payload(result, cutoff))
 
     indices: dict[str, IndexSeries] = {}
     for name, result in index_results.items():
         series = parse_index_payload(result, cutoff)
         if series:
             indices[name] = series
-    for required in config.index_required:
-        if required not in indices:
-            errors.append(f"required index context unavailable: {required}")
-    return list(by_symbol.values()), indices, errors
+
+    return all_stocks, indices
