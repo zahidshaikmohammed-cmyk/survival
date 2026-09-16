@@ -6,6 +6,7 @@ from survival_engine.data import parse_candles
 from survival_engine.mathx import pearson
 from survival_engine.models import Candle, Features, Stock
 from survival_engine.selector import select_top3
+from survival_engine.strategy import score_universe
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -38,6 +39,16 @@ class SurvivalTests(unittest.TestCase):
 
     def test_pearson_identical_vectors_is_one(self):
         self.assertAlmostEqual(pearson([1, 2, 3, 4, 5], [1, 2, 3, 4, 5]), 1.0, places=9)
+
+    def test_strategy_scores_full_synthetic_universe_without_exception(self):
+        stocks = [Stock(f"S{i}", str(i), 100, 100, make_candles(100 + i), "a") for i in range(10)]
+        scored = score_universe(stocks, {}, Config())
+        self.assertEqual(len(scored), 10)
+        self.assertTrue(all(0.0 <= item.score <= 100.0 for item in scored))
+        self.assertTrue(all(item.direction in {"LONG", "SHORT"} for item in scored))
+        self.assertTrue(all(item.setup in {"CONTINUATION", "RANGE_REJECTION"} for item in scored))
+        self.assertTrue(all(item.stop != item.entry for item in scored))
+        self.assertTrue(all(item.target != item.entry for item in scored))
 
     def test_selector_returns_three(self):
         candles = make_candles(100)
