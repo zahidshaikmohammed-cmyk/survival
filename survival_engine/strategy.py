@@ -113,7 +113,11 @@ def _vix_noise_penalty(indices: dict[str, IndexSeries]) -> float:
 def _build_candidate(stock: Stock, indices: dict[str, IndexSeries], config: Config, universe_r15: float, universe_r30: float, universe_r60: float) -> Features | None:
     candles = stock.candles
     closes = _closes(stock)
+    if not closes:
+        return None
     last = closes[-1]
+
+    # These are strategy constraints (tradability/liquidity), not data-quality gates.
     if last < config.minimum_price:
         return None
     avg_vol = mean([c.volume for c in candles[-config.volume_window:]])
@@ -146,28 +150,42 @@ def _build_candidate(stock: Stock, indices: dict[str, IndexSeries], config: Conf
     market_align = _market_alignment(r30, indices, direction)
     vix_penalty = _vix_noise_penalty(indices)
 
-    continuation = 0.24 * clamp(abs(rs30) / 35.0, 0.0, 1.0) + 0.18 * persistence + 0.18 * trend + 0.16 * structure + 0.10 * clamp(vol_ratio / 2.5, 0.0, 1.0) + 0.08 * (1.0 if dist_vwap * direction >= 0 else 0.0) + 0.06 * market_align
+    continuation = (
+        0.24 * clamp(abs(rs30) / 35.0, 0.0, 1.0)
+        + 0.18 * persistence
+        + 0.18 * trend
+        + 0.16 * structure
+        + 0.10 * clamp(vol_ratio / 2.5, 0.0, 1.0)
+        + 0.08 * (1.0 if dist_vwap * direction >= 0 else 0.0)
+        + 0.06 * market_align
+    )
     range_edge = min(abs(distance_high), abs(distance_low)) < max(0.02, 2.0 * atr_pct)
     rejection_quality = 0.0
     if range_edge:
         rejection_quality = 0.35 * (1.0 - exhaustion) + 0.35 * (1.0 - noise) + 0.30 * market_align
     setup = "CONTINUATION" if continuation >= rejection_quality else "RANGE_REJECTION"
 
-    raw_score = (0.18 * clamp(abs(rs15) / 35.0, 0.0, 1.0) + 0.22 * clamp(abs(rs30) / 50.0, 0.0, 1.0) + 0.10 * clamp(abs(rs60) / 70.0, 0.0, 1.0) + 0.15 * persistence + 0.12 * trend + 0.10 * structure + 0.07 * clamp(vol_ratio / 2.5, 0.0, 1.0) + 0.04 * liquidity + 0.02 * market_align) * 100.0
+    raw_score = (
+        0.18 * clamp(abs(rs15) / 35.0, 0.0, 1.0)
+        + 0.22 * clamp(abs(rs30) / 50.0, 0.0, 1.0)
+        + 0.10 * clamp(abs(rs60) / 70.0, 0.0, 1.0)
+        + 0.15 * persistence
+        + 0.12 * trend
+        + 0.10 * structure
+        + 0.07 * clamp(vol_ratio / 2.5, 0.0, 1.0)
+        + 0.04 * liquidity
+        + 0.02 * market_align
+    ) * 100.0
     raw_score -= 10.0 * exhaustion + 8.0 * noise + 4.0 * vix_penalty
     if setup == "RANGE_REJECTION":
         raw_score += 2.0 * rejection_quality
     score = clamp(raw_score, 0.0, 100.0)
-    if score < config.min_entry_score:
-        return None
 
     entry = last
     risk_unit = max(atr_value * config.stop_atr_multiple, last * 0.0015)
     stop = entry - risk_unit if direction > 0 else entry + risk_unit
     target = entry + config.target_r_multiple * risk_unit if direction > 0 else entry - config.target_r_multiple * risk_unit
     reward_risk = abs(target - entry) / abs(entry - stop)
-    if reward_risk < config.risk_reward_floor:
-        return None
 
     reasons: list[str] = []
     if abs(rs30) > 3.0:
@@ -194,7 +212,44 @@ def _build_candidate(stock: Stock, indices: dict[str, IndexSeries], config: Conf
         rejection_reasons.append("elevated broad-market volatility")
 
     band = "A" if score >= 75 else "B+" if score >= 66 else "B"
-    return Features(symbol=stock.symbol, direction="LONG" if direction > 0 else "SHORT", score=score, confidence_band=band, last_price=last, return_5m=r5, return_15m=r15, return_30m=r30, return_60m=r60, relative_15m=rs15, relative_30m=rs30, relative_60m=rs60, opening_gap=pct(stock.today_open, stock.previous_close), distance_vwap=dist_vwap, distance_high=distance_high, distance_low=distance_low, atr=atr_value, atr_pct=atr_pct, volume_ratio=vol_ratio, persistence=persistence, trend_quality=trend, structure_quality=structure, exhaustion=exhaustion, noise=noise, liquidity_quality=liquidity, market_alignment=market_align, setup=setup, reasons=reasons, rejection_reasons=rejection_reasons, risk_unit=risk_unit, entry=entry, stop=stop, target=target, reward_risk=reward_risk, hard_exit="13:15 IST")
+    return Features(
+        symbol=stock.symbol,
+        direction="LONG" if direction > 0 else "SHORT",
+        score=score,
+        confidence_band=band,
+        last_price=last,
+        return_5m=r5,
+        return_15m=r15,
+        return_30m=r30,
+        return_60m=r60,
+        relative_15m=rs15,
+        relative_30m=rs30,
+        relative_60m=rs60,
+        opening_gap=pct(stock.today_open, stock.previous_close),
+        distance_vwap=dist_vwap,
+        distance_high=distance_high,
+        distance_low=distance_low,
+        atr=atr_value,
+        atr_pct=atr_pct,
+        volume_ratio=vol_ratio,
+        persistence=persistence,
+        trend_quality=trend,
+        structure_quality=structure,
+        exhaustion=exhaustion,
+        noise=noise,
+        liquidity_quality=liquidity,
+        market_alignment=market_align,
+        sector_alignment=0.0,
+        setup=setup,
+        reasons=reasons,
+        rejection_reasons=rejection_reasons,
+        risk_unit=risk_unit,
+        entry=entry,
+        stop=stop,
+        target=target,
+        reward_risk=reward_risk,
+        hard_exit="13:15 IST",
+    )
 
 
 def _universe_returns(stocks: list[Stock], minutes: int) -> list[float]:
