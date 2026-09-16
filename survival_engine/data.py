@@ -28,77 +28,41 @@ class FetchResult:
 
 
 def _request_json(name: str, url: str, timeout: float, retries: int) -> FetchResult:
-    """Fetch one authoritative PSYGRID endpoint.
-
-    SURVIVAL assumes the upstream acquisition layer is authoritative. This
-    function therefore does transport/JSON decoding only; it does not make
-    trading decisions and does not apply data-quality gates.
-    """
+    """Fetch one authoritative PSYGRID endpoint without strategy/data gates."""
     started = time.perf_counter()
     last_error = "unknown error"
     for attempt in range(retries + 1):
         try:
-            req = Request(
-                url,
-                headers={
-                    "Accept": "application/json",
-                    "Cache-Control": "no-cache, no-store",
-                    "User-Agent": "PSYGRID-SURVIVAL/1.0",
-                },
-            )
+            req = Request(url, headers={
+                "Accept": "application/json",
+                "Cache-Control": "no-cache, no-store",
+                "User-Agent": "PSYGRID-SURVIVAL/1.0",
+            })
             with urlopen(req, timeout=timeout) as response:
                 status = getattr(response, "status", 200)
                 raw = response.read()
             payload = json.loads(raw.decode("utf-8"))
-            return FetchResult(
-                name,
-                url,
-                payload,
-                None,
-                (time.perf_counter() - started) * 1000,
-                status,
-            )
+            return FetchResult(name, url, payload, None, (time.perf_counter() - started) * 1000, status)
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, ValueError, OSError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             if attempt < retries:
                 time.sleep(0.25 * (attempt + 1))
-    return FetchResult(
-        name,
-        url,
-        None,
-        last_error,
-        (time.perf_counter() - started) * 1000,
-        None,
-    )
+    return FetchResult(name, url, None, last_error, (time.perf_counter() - started) * 1000, None)
 
 
 def fetch_endpoints(config: Config) -> tuple[dict[str, FetchResult], dict[str, FetchResult]]:
-    """Fetch the ten stock shards and all configured index/context endpoints."""
+    """Fetch ten stock shards and all market/context endpoints in parallel."""
     stock_results: dict[str, FetchResult] = {}
     index_results: dict[str, FetchResult] = {}
     with ThreadPoolExecutor(max_workers=config.max_workers) as pool:
         futures = {
-            pool.submit(
-                _request_json,
-                name,
-                url,
-                config.request_timeout_seconds,
-                config.request_retries,
-            ): ("stock", name)
+            pool.submit(_request_json, name, url, config.request_timeout_seconds, config.request_retries): ("stock", name)
             for name, url in STOCK_ENDPOINTS.items()
         }
-        futures.update(
-            {
-                pool.submit(
-                    _request_json,
-                    name,
-                    url,
-                    config.request_timeout_seconds,
-                    config.request_retries,
-                ): ("index", name)
-                for name, url in INDEX_ENDPOINTS.items()
-            }
-        )
+        futures.update({
+            pool.submit(_request_json, name, url, config.request_timeout_seconds, config.request_retries): ("index", name)
+            for name, url in INDEX_ENDPOINTS.items()
+        })
         for future in as_completed(futures):
             kind, name = futures[future]
             result = future.result()
@@ -154,58 +118,46 @@ def parse_candles(rows: list[dict[str, Any]]) -> list[Candle]:
         if not isinstance(row, dict):
             continue
         try:
-            candles.append(
-                Candle(
-                    ts=_parse_ts(row.get("timestamp", row.get("ts", row.get("time")))),
-                    open=_num(row, "open", "o"),
-                    high=_num(row, "high", "h"),
-                    low=_num(row, "low", "l"),
-                    close=_num(row, "close", "c"),
-                    volume=_num(row, "volume", "v"),
-                )
-            )
+            candles.append(Candle(
+                ts=_parse_ts(row.get("timestamp", row.get("ts", row.get("time")))),
+                open=_num(row, "open", "o"),
+                high=_num(row, "high", "h"),
+                low=_num(row, "low", "l"),
+                close=_num(row, "close", "c"),
+                volume=_num(row, "volume", "v"),
+            ))
         except (ValueError, TypeError, KeyError):
             continue
     candles.sort(key=lambda c: c.ts)
     return candles
 
 
-def parse_stock_payload(
-    result: FetchResult,
-    cutoff: datetime,
-) -> list[Stock]:
-    """Turn one live shard into Stock objects.
+def parse_stock_payload(result: FetchResult, cutoff: datetime | None = None) -> list[Stock]:
+    """Build stocks from the latest available PSYGRID candles.
 
-    No shard-count gate, no stale gate, no minimum-bar gate and no OHLC gate
-    are applied here. The upstream PSYGRID acquisition layer is authoritative;
-    SURVIVAL's job starts after ingestion.
+    ``cutoff`` is retained only for historical replay compatibility. Live
+    SURVIVAL execution passes None and therefore never imposes a clock cutoff.
     """
     if result.payload is None:
         return []
-
     stocks_obj = result.payload.get("stocks", {})
     if not isinstance(stocks_obj, dict):
         return []
-
     out: list[Stock] = []
     for symbol, item in stocks_obj.items():
         if not isinstance(item, dict):
             continue
         try:
-            candles = [c for c in parse_candles(_extract_rows(item)) if c.ts <= cutoff]
-            previous_close = float(item.get("previous_close"))
-            today_open = float(item.get("today_open"))
-            security_id = str(item.get("security_id", ""))
-            out.append(
-                Stock(
-                    str(item.get("symbol", symbol)),
-                    security_id,
-                    previous_close,
-                    today_open,
-                    candles,
-                    result.name,
-                )
-            )
+            parsed = parse_candles(_extract_rows(item))
+            candles = [c for c in parsed if cutoff is None or c.ts <= cutoff]
+            out.append(Stock(
+                str(item.get("symbol", symbol)),
+                str(item.get("security_id", "")),
+                float(item.get("previous_close")),
+                float(item.get("today_open")),
+                candles,
+                result.name,
+            ))
         except (TypeError, ValueError):
             continue
     return out
@@ -226,23 +178,23 @@ def _index_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
-def parse_index_payload(result: FetchResult, cutoff: datetime) -> IndexSeries | None:
+def parse_index_payload(result: FetchResult, cutoff: datetime | None = None) -> IndexSeries | None:
     if result.payload is None:
         return None
-    rows = [c for c in parse_candles(_index_rows(result.payload)) if c.ts <= cutoff]
+    parsed = parse_candles(_index_rows(result.payload))
+    rows = [c for c in parsed if cutoff is None or c.ts <= cutoff]
     return IndexSeries(result.name, rows, result.name) if rows else None
 
 
 def assemble_universe(
     stock_results: dict[str, FetchResult],
     index_results: dict[str, FetchResult],
-    cutoff: datetime,
+    cutoff: datetime | None = None,
 ) -> tuple[list[Stock], dict[str, IndexSeries]]:
-    """Assemble the authoritative universe for the strategy.
+    """Assemble SURVIVAL from the latest available upstream market state.
 
-    There are deliberately no data-quality gates here. The function does not
-    reject stale candles, reject shard sizes, reject duplicate symbols, reject
-    missing bars, or abort because a data-quality rule was triggered.
+    No timestamp, stale-data, shard-size, completeness, minimum-bar,
+    duplicate-symbol, or trading-data quality gate is applied.
     """
     all_stocks: list[Stock] = []
     for name in sorted(STOCK_ENDPOINTS):
@@ -255,5 +207,4 @@ def assemble_universe(
         series = parse_index_payload(result, cutoff)
         if series:
             indices[name] = series
-
     return all_stocks, indices
