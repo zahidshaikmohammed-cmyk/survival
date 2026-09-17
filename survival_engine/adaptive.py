@@ -32,6 +32,78 @@ def _pivot_levels(candles: list[Candle], direction: int, window: int = 30) -> tu
     return supports, resistances
 
 
+def _market_regime(stocks: list[Stock]) -> tuple[int, float, float, float]:
+    """Infer broad intraday direction from the stock cross-section itself.
+
+    The live SURVIVAL engine currently receives the 450-stock snapshot without
+    index series. The median cross-section therefore becomes the market proxy.
+    The regime combines 15m/30m/60m median returns with breadth, so one stock
+    cannot dictate the direction. The result is used as a strong prior, not as
+    a data-quality gate.
+    """
+    if not stocks:
+        return 0, 0.0, 0.0, 0.0
+
+    def ret(stock: Stock, minutes: int) -> float:
+        closes = [c.close for c in stock.candles]
+        if len(closes) <= minutes:
+            return 0.0
+        return closes[-1] / closes[-1 - minutes] - 1.0
+
+    r15 = [ret(stock, 15) for stock in stocks]
+    r30 = [ret(stock, 30) for stock in stocks]
+    r60 = [ret(stock, 60) for stock in stocks]
+    med15 = median(r15)
+    med30 = median(r30)
+    med60 = median(r60)
+
+    composite = 0.20 * med15 + 0.50 * med30 + 0.30 * med60
+    breadth30 = sum(1 for value in r30 if value > 0) / len(r30)
+    breadth_strength = abs(breadth30 - 0.5) * 2.0
+    return_strength = min(abs(composite) / 0.0035, 1.0)
+    strength = min(1.0, 0.60 * return_strength + 0.40 * breadth_strength)
+
+    if composite > 0:
+        direction = 1
+    elif composite < 0:
+        direction = -1
+    else:
+        direction = 0
+    return direction, strength, composite, breadth30
+
+
+def _regime_adjustment(candidate: Features, regime: tuple[int, float, float, float]) -> tuple[float, list[str], list[str]]:
+    """Prefer trades aligned with the dominant cross-sectional market direction."""
+    regime_direction, strength, composite, breadth30 = regime
+    if regime_direction == 0 or strength < 0.20:
+        return 0.0, [], []
+
+    candidate_direction = 1 if candidate.direction == "LONG" else -1
+    aligned = candidate_direction == regime_direction
+    label = "bullish" if regime_direction > 0 else "bearish"
+    adjustment = 0.0
+    reasons: list[str] = [
+        f"cross-sectional market regime is {label}",
+        f"30m market breadth={breadth30:.0%}",
+    ]
+    rejection: list[str] = []
+
+    if aligned:
+        adjustment += 8.0 * strength
+        reasons.append("trade direction aligns with the dominant market regime")
+    else:
+        # Counter-trend trades are allowed to remain in the universe, but they
+        # must overcome a meaningful regime penalty. Reversion trades receive
+        # an additional penalty because the prior engine was selecting them
+        # too freely against a persistent market move.
+        adjustment -= 22.0 * strength
+        if candidate.setup == "RANGE_REJECTION":
+            adjustment -= 8.0 * strength
+        rejection.append("counter-trend versus dominant market regime")
+
+    return adjustment, reasons, rejection
+
+
 def _adaptive_geometry(stock: Stock, candidate: Features) -> tuple[float, float, float, float, list[str]]:
     """Derive stop/target from the current price structure, not a fixed R multiple."""
     candles = stock.candles
@@ -47,8 +119,6 @@ def _adaptive_geometry(stock: Stock, candidate: Features) -> tuple[float, float,
     median_range = _median_true_range(candles, 12)
     atr = max(candidate.atr, 1e-9)
 
-    # The buffer expands when recent bars are large relative to ATR and contracts
-    # when the tape is quiet. It is therefore a property of the current state.
     range_ratio = median_range / atr
     buffer = median_range * (0.35 + 0.35 * min(range_ratio, 1.5))
     buffer = max(buffer, atr * 0.12)
@@ -68,9 +138,6 @@ def _adaptive_geometry(stock: Stock, candidate: Features) -> tuple[float, float,
         objectives = below + ([recent_low] if recent_low < entry else [])
         target = objectives[0] if objectives else entry - max(atr, median_range)
 
-    # If the nearest structural objective is inside the current spread/noise,
-    # advance to the next objective. This prevents microscopic targets such as
-    # the fixed 1.55R behaviour from dominating a structural trade.
     minimum_objective_distance = max(median_range, atr * 0.65)
     if direction > 0:
         for objective in objectives:
@@ -91,9 +158,6 @@ def _adaptive_geometry(stock: Stock, candidate: Features) -> tuple[float, float,
             stop = entry + max(median_range, atr * 0.8)
             risk = stop - entry
 
-    # If the structural target lies beyond the current 30-minute range, use the
-    # current range boundary only when it is directionally valid. This keeps the
-    # objective tied to observed structure rather than a synthetic R multiple.
     if direction > 0 and target <= entry:
         target = recent_high if recent_high > entry else entry + max(atr, median_range)
     if direction < 0 and target >= entry:
@@ -116,9 +180,6 @@ def _opportunity_adjustment(candidate: Features, risk: float, target: float) -> 
         return -20.0
     reward = abs(target - candidate.last_price)
     rr = reward / risk
-    # Dynamic, cross-sectional scaling: no fixed R:R threshold decides whether
-    # a trade exists. The score is rewarded when the current structure offers
-    # materially more room than its invalidation distance.
     room_factor = min(reward / max(candidate.atr, 1e-9), 4.0) / 4.0
     structure_factor = candidate.structure_quality
     noise_factor = 1.0 - candidate.noise
@@ -128,23 +189,32 @@ def _opportunity_adjustment(candidate: Features, risk: float, target: float) -> 
 
 
 def score_universe(stocks: list[Stock], indices: dict[str, IndexSeries], config: Config) -> list[Features]:
-    """Score the universe with the existing signal logic plus adaptive geometry."""
+    """Score the universe with adaptive geometry and a market-regime prior."""
     base = _base_score_universe(stocks, indices, config)
     by_symbol = {stock.symbol: stock for stock in stocks}
+    regime = _market_regime(stocks)
     out: list[Features] = []
+
     for candidate in base:
         stock = by_symbol.get(candidate.symbol)
         if stock is None:
             out.append(candidate)
             continue
+
         risk, entry, stop, target, notes = _adaptive_geometry(stock, candidate)
         adjustment = _opportunity_adjustment(candidate, risk, target)
-        score = max(0.0, min(100.0, candidate.score + adjustment))
+        regime_adjustment, regime_reasons, regime_rejections = _regime_adjustment(candidate, regime)
+        score = max(0.0, min(100.0, candidate.score + adjustment + regime_adjustment))
+
         reasons = [r for r in candidate.reasons if not r.startswith("sufficient remaining range")]
         reasons.extend(notes)
+        reasons.extend(regime_reasons)
+
         rejection = list(candidate.rejection_reasons)
+        rejection.extend(regime_rejections)
         if abs(target - entry) < max(candidate.atr * 0.65, 1e-9):
             rejection.append("structural objective too close to current price")
+
         return_candidate = replace(
             candidate,
             score=score,
@@ -158,4 +228,5 @@ def score_universe(stocks: list[Stock], indices: dict[str, IndexSeries], config:
             rejection_reasons=rejection,
         )
         out.append(return_candidate)
+
     return sorted(out, key=lambda x: (-x.score, x.symbol))
