@@ -7,7 +7,7 @@ from .config import Config, STOCK_ENDPOINT
 from .data import IST, assemble_universe, fetch_universe
 from .report import print_report, write_report
 from .selector import select_top3
-from .strategy import score_universe
+from .adaptive import score_universe
 
 
 def now_ist() -> datetime:
@@ -28,14 +28,7 @@ def _payload_status(result: Any) -> str | None:
 
 
 def run_once(config: Config, allow_before_decision: bool = False) -> int:
-    """Run SURVIVAL against the single latest 450-stock PSYGRID snapshot.
-
-    The upstream PSYGRID snapshot is authoritative. There is no local
-    timestamp/staleness/completeness/minimum-bars/duplicate-symbol/data-quality
-    rejection gate. The strategy itself is unchanged; it receives an empty
-    index-context mapping because SURVIVAL now operates solely on the 450-stock
-    cross-section supplied by live.json.
-    """
+    """Run SURVIVAL against the single latest 450-stock PSYGRID snapshot."""
     decision_now = now_ist()
 
     print("\n[1/4] FETCHING PSYGRID: SINGLE 450-STOCK ENDPOINT...")
@@ -92,8 +85,6 @@ def run_once(config: Config, allow_before_decision: bool = False) -> int:
         return 0
 
     print("[3/4] RUNNING SURVIVAL ACROSS ALL AVAILABLE STOCKS...")
-    # Strategy is intentionally unchanged. The stock universe itself supplies
-    # the cross-sectional reference returns; no external index endpoint is used.
     candidates = score_universe(stocks, {}, config)
     selected = select_top3(candidates, stocks, config)
 
@@ -110,7 +101,7 @@ def run_once(config: Config, allow_before_decision: bool = False) -> int:
         "engine_mode": "LATEST_AVAILABLE_DATA",
         "data_quality_layer": "UPSTREAM_AUTHORITY",
         "run_status": "SIGNALS_GENERATED" if selected else "NO_CANDIDATES",
-        "run_reason": "Strategy ranking completed on the single upstream 450-stock snapshot.",
+        "run_reason": "Adaptive structural ranking completed on the single upstream 450-stock snapshot.",
         "endpoint_error": result.error,
         "upstream_status": status,
     }
