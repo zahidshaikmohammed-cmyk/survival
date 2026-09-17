@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from survival_engine.adaptive import _stock_direction_integrity
+from survival_engine.adaptive import _stock_context
 from survival_engine.models import Candle, Stock
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -28,21 +28,25 @@ def make_stock(up: bool) -> Stock:
 
 class DirectionIntegrityTests(unittest.TestCase):
     def test_uptrend_agrees_with_long(self):
-        integrity, reasons, rejection = _stock_direction_integrity(make_stock(True), 1)
+        integrity, context = _stock_context(make_stock(True), 1)
         self.assertGreater(integrity, 0.70)
-        self.assertTrue(reasons)
-        self.assertFalse(rejection)
+        self.assertGreaterEqual(context["agreement"], 0.75)
+        self.assertEqual(context["ema"], 1.0)
+        self.assertEqual(context["vwap"], 1.0)
 
     def test_uptrend_disagrees_with_short(self):
-        integrity, _, rejection = _stock_direction_integrity(make_stock(True), -1)
+        integrity, context = _stock_context(make_stock(True), -1)
         self.assertLess(integrity, 0.35)
-        self.assertIn("stock trend directly contradicts proposed direction", rejection)
+        self.assertLessEqual(context["agreement"], 0.25)
+        self.assertEqual(context["ema"], 0.0)
+        self.assertEqual(context["vwap"], 0.0)
 
     def test_downtrend_agrees_with_short(self):
-        integrity, reasons, rejection = _stock_direction_integrity(make_stock(False), -1)
+        integrity, context = _stock_context(make_stock(False), -1)
         self.assertGreater(integrity, 0.70)
-        self.assertTrue(reasons)
-        self.assertFalse(rejection)
+        self.assertGreaterEqual(context["agreement"], 0.75)
+        self.assertEqual(context["ema"], 1.0)
+        self.assertEqual(context["vwap"], 1.0)
 
 
 if __name__ == "__main__":
