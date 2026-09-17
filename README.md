@@ -4,30 +4,32 @@ A cross-sectional intraday stock-selection engine for the PSYGRID 450-stock univ
 
 ## Source architecture
 
-- 10 stock endpoints: `live-a.json` through `live-j.json`
-- The intended universe is 450 stocks across those ten shards
-- Market/context endpoints are fetched separately and are treated as optional context
+- One stock endpoint: `live.json`
+- The endpoint contains the complete 450-stock universe under `stocks`
+- No stock shards are used
+- No NIFTY, BANK NIFTY, SENSEX, sector-index, or India VIX endpoint is used by SURVIVAL
 - The PSYGRID stock schema uses `stocks`, `security_id`, `previous_close`, `today_open`, and `candles_1m`
 
 ## Execution model
 
-SURVIVAL uses the **latest market state returned by the upstream PSYGRID service at the moment it runs**. There is no local stale-data, timestamp, shard-size, completeness, minimum-bars, duplicate-symbol, or data-quality rejection gate.
+SURVIVAL uses the **latest market state returned by the upstream PSYGRID service at the moment it runs**. There is no local stale-data, timestamp, completeness, minimum-bars, duplicate-symbol, or data-quality rejection gate.
 
 The upstream service is authoritative for whether a live market snapshot is available.
 
-When the stock endpoints are live, SURVIVAL:
+When the stock endpoint is live, SURVIVAL:
 
-1. Fetches all ten stock shards concurrently plus configured market/context endpoints.
+1. Fetches the single `live.json` endpoint containing the 450-stock universe.
 2. Builds the latest available stock universe.
-3. Calculates cross-sectional relative returns, persistence, trend quality, structure, volume participation, VWAP relationship, volatility, noise, exhaustion and market alignment.
-4. Generates LONG/SHORT direction from the cross-sectional evidence.
-5. Ranks candidates and applies the correlation-diversification penalty.
-6. Produces up to three execution plans.
-7. Uses a 13:15 IST hard exit.
+3. Applies the existing strategy unchanged, using the stock cross-section as its available reference data and no external index/context series.
+4. Calculates cross-sectional relative returns, persistence, trend quality, structure, volume participation, VWAP relationship, volatility, noise and exhaustion.
+5. Generates LONG/SHORT direction from the existing cross-sectional evidence.
+6. Ranks candidates and applies the existing correlation-diversification penalty.
+7. Produces up to three execution plans.
+8. Uses a 13:15 IST hard exit.
 
 ## Closed market behavior
 
-If all ten stock shards explicitly report `CLOSED`, SURVIVAL does **not** fabricate a Top-3. It writes a `NO TRADE SIGNAL` report with `UPSTREAM_SESSION_CLOSED` status and records which shards were closed.
+If the single stock endpoint explicitly reports `CLOSED`, SURVIVAL does **not** fabricate a Top-3. It writes a `NO TRADE SIGNAL` report with `UPSTREAM_SESSION_CLOSED` status.
 
 This is expected behavior when the upstream server has no live stock snapshot available.
 
@@ -38,7 +40,7 @@ Each run writes:
 - `outputs/survival_YYYYMMDD_HHMMSS.json`
 - `outputs/survival_latest.json`
 
-The report records the run status, received stock count, available context, endpoint failures, selected trades, entry reference, stop, target and hard exit.
+The report records the run status, received stock count, selected trades, entry reference, stop, target and hard exit.
 
 ## Run locally
 
@@ -54,7 +56,21 @@ or:
 python survival.py
 ```
 
-`--test-now` is retained for compatibility; the current engine already uses the latest upstream state immediately.
+`--test-now` is retained for CLI compatibility; the current engine already uses the latest upstream state immediately.
+
+## Live smoke test
+
+To test the complete live pipeline against the single endpoint and require exactly three selected trades:
+
+```powershell
+py -3 smoke_test.py --require-live
+```
+
+Expected live path:
+
+```text
+Single endpoint → 450 stocks → 450 candidates → 3 selected trades
+```
 
 ## Tests
 
@@ -64,15 +80,17 @@ The production app uses Python standard-library modules.
 py -3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+The unit suite includes explicit coverage that one PSYGRID payload can parse and score all 450 stock records.
+
 ## Setup
 
 1. Install Python 3.11+.
 2. Clone this repository.
 3. Ensure the machine can reach `140.245.226.102:10000`.
-4. Run `py -3 survival.py` when the upstream PSYGRID stock endpoints are live.
+4. Run `py -3 survival.py` when the upstream PSYGRID stock endpoint is live.
 5. Review `outputs/survival_latest.json` after the run.
 
-No API key or broker credentials are required by this version because it only reads the public PSYGRID endpoints.
+No API key or broker credentials are required by this version because it only reads the public PSYGRID endpoint.
 
 ## Important
 
