@@ -3,30 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import time
 
+# Single authoritative PSYGRID endpoint containing the complete 450-stock universe.
 BASE_URL = "http://140.245.226.102:10000/public"
-
-# Exactly ten stock shards: live-a through live-j = the 450-stock universe.
-STOCK_ENDPOINTS = {letter: f"{BASE_URL}/live-{letter}.json" for letter in "abcdefghij"}
-
-# Market/context series used by the strategy as reference information.
-INDEX_ENDPOINTS = {
-    "nifty": f"{BASE_URL}/nifty.json",
-    "banknifty": f"{BASE_URL}/banknifty.json",
-    "sensex": f"{BASE_URL}/sensex.json",
-    "nifty500": f"{BASE_URL}/nifty500.json",
-    "niftymidcap100": f"{BASE_URL}/niftymidcap100.json",
-    "niftysmallcap100": f"{BASE_URL}/niftysmallcap100.json",
-    "finnifty": f"{BASE_URL}/finnifty.json",
-    "indiavix": f"{BASE_URL}/indiavix.json",
-    "niftyit": f"{BASE_URL}/niftyit.json",
-    "niftyauto": f"{BASE_URL}/niftyauto.json",
-    "niftypharma": f"{BASE_URL}/niftypharma.json",
-    "niftymetal": f"{BASE_URL}/niftymetal.json",
-    "niftyfmcg": f"{BASE_URL}/niftyfmcg.json",
-    "niftyrealty": f"{BASE_URL}/niftyrealty.json",
-    "niftyenergy": f"{BASE_URL}/niftyenergy.json",
-    "niftyinfra": f"{BASE_URL}/niftyinfra.json",
-}
+STOCK_ENDPOINT = f"{BASE_URL}/live.json"
 
 
 @dataclass(frozen=True)
@@ -39,11 +18,9 @@ class Config:
     # Runtime only; these are not strategy/data gates.
     request_timeout_seconds: float = 8.0
     request_retries: int = 2
-    max_workers: int = 20
+    max_workers: int = 4
 
     # Universe definition.
-    expected_shards: int = 10
-    expected_stocks_per_shard: int = 45
     expected_universe: int = 450
     final_trades: int = 3
 
