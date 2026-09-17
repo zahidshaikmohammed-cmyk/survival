@@ -3,8 +3,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from .config import Config
-from .data import IST, assemble_universe, fetch_endpoints
+from .config import Config, STOCK_ENDPOINT
+from .data import IST, assemble_universe, fetch_universe
 from .report import print_report, write_report
 from .selector import select_top3
 from .strategy import score_universe
@@ -28,84 +28,62 @@ def _payload_status(result: Any) -> str | None:
 
 
 def run_once(config: Config, allow_before_decision: bool = False) -> int:
-    """Run SURVIVAL against the newest market state available right now.
+    """Run SURVIVAL against the single latest 450-stock PSYGRID snapshot.
 
     The upstream PSYGRID snapshot is authoritative. There is no local
-    timestamp/staleness/completeness gate. A closed upstream session is
-    reported explicitly as NO SIGNAL rather than being rendered as an
-    apparently valid empty Top-3 decision.
+    timestamp/staleness/completeness/minimum-bars/duplicate-symbol/data-quality
+    rejection gate. The strategy itself is unchanged; it receives an empty
+    index-context mapping because SURVIVAL now operates solely on the 450-stock
+    cross-section supplied by live.json.
     """
     decision_now = now_ist()
 
-    print("\n[1/4] FETCHING LATEST PSYGRID: 10 STOCK SHARDS + INDEX CONTEXT...")
-    stock_results, index_results = fetch_endpoints(config)
+    print("\n[1/4] FETCHING PSYGRID: SINGLE 450-STOCK ENDPOINT...")
+    result = fetch_universe(config)
 
-    print("[2/4] BUILDING THE LATEST AVAILABLE STRATEGY UNIVERSE...")
-    stocks, indices = assemble_universe(stock_results, index_results, None)
+    print("[2/4] BUILDING THE LATEST AVAILABLE 450-STOCK UNIVERSE...")
+    stocks = assemble_universe(result, None)
 
     latest_stock_ts = max(
         (c.ts for stock in stocks for c in stock.candles),
         default=None,
     )
-    latest_index_ts = max(
-        (c.ts for series in indices.values() for c in series.candles),
-        default=None,
-    )
+    status = _payload_status(result)
 
-    stock_statuses = {
-        name: _payload_status(result)
-        for name, result in stock_results.items()
-    }
-    closed_stock_shards = sorted(
-        name for name, status in stock_statuses.items() if status == "CLOSED"
-    )
-    failed_stock_shards = sorted(
-        name for name, result in stock_results.items() if result.error
-    )
-    failed_index_endpoints = sorted(
-        name for name, result in index_results.items() if result.error
-    )
-
+    print(f"    ENDPOINT: {STOCK_ENDPOINT}")
+    print(f"    JSON RECEIVED: {'YES' if result.payload is not None else 'NO'}")
+    print(f"    UPSTREAM STATUS: {status or 'UNKNOWN'}")
     print(f"    STOCKS RECEIVED: {len(stocks)}")
-    print(f"    LATEST STOCK CANDLE: {latest_stock_ts.isoformat() if latest_stock_ts else 'N/A'}")
-    print(f"    INDEX SERIES AVAILABLE: {len(indices)}")
-    print(f"    LATEST INDEX CANDLE: {latest_index_ts.isoformat() if latest_index_ts else 'N/A'}")
-
-    # If every stock shard explicitly reports CLOSED, there is no live
-    # universe to rank. Do not fabricate a Top-3 from an empty input.
-    all_stock_shards_closed = (
-        len(stock_results) == config.expected_shards
-        and len(closed_stock_shards) == config.expected_shards
+    print(
+        f"    LATEST STOCK CANDLE: "
+        f"{latest_stock_ts.isoformat() if latest_stock_ts else 'N/A'}"
     )
 
-    if all_stock_shards_closed or not stocks:
-        status = "UPSTREAM_SESSION_CLOSED" if all_stock_shards_closed else "NO_STOCK_DATA"
+    if status == "CLOSED" or not stocks:
+        run_status = "UPSTREAM_SESSION_CLOSED" if status == "CLOSED" else "NO_STOCK_DATA"
         reason = (
-            "All ten PSYGRID stock shards report CLOSED; no live stock universe is available."
-            if all_stock_shards_closed
-            else "No stock records were parsed from the configured PSYGRID stock shards."
+            "The single PSYGRID stock endpoint reports CLOSED; no live stock decision is generated."
+            if status == "CLOSED"
+            else "No stock records were parsed from the single PSYGRID stock endpoint."
         )
         metadata: dict[str, Any] = {
             "decision_time": decision_now.isoformat(),
             "data_cutoff": None,
-            "latest_stock_candle": None,
-            "latest_index_candle": latest_index_ts.isoformat() if latest_index_ts else None,
+            "latest_stock_candle": latest_stock_ts.isoformat() if latest_stock_ts else None,
             "received_stock_records": len(stocks),
-            "index_series_available": len(indices),
-            "index_context_available": sorted(indices),
+            "expected_universe": config.expected_universe,
             "candidate_count": 0,
             "final_count": 0,
-            "stock_endpoints": config.expected_shards,
+            "stock_endpoint": STOCK_ENDPOINT,
             "hard_exit": "13:15 IST",
             "engine_mode": "LATEST_AVAILABLE_DATA",
             "data_quality_layer": "UPSTREAM_AUTHORITY",
-            "run_status": status,
+            "run_status": run_status,
             "run_reason": reason,
-            "closed_stock_shards": closed_stock_shards,
-            "failed_stock_shards": failed_stock_shards,
-            "failed_index_endpoints": failed_index_endpoints,
+            "endpoint_error": result.error,
+            "upstream_status": status,
         }
-        print("[3/4] NO TRADE — NO LIVE STOCK UNIVERSE AVAILABLE")
+        print("[3/4] NO TRADE — NO LIVE 450-STOCK UNIVERSE AVAILABLE")
         print("[4/4] WRITING NO-SIGNAL REPORT")
         print_report([], metadata)
         json_path, latest_path = write_report([], metadata, config.output_dir)
@@ -113,29 +91,28 @@ def run_once(config: Config, allow_before_decision: bool = False) -> int:
         print(f"Latest: {latest_path}")
         return 0
 
-    print("[3/4] RUNNING SURVIVAL ACROSS THE ENTIRE AVAILABLE UNIVERSE...")
-    candidates = score_universe(stocks, indices, config)
+    print("[3/4] RUNNING SURVIVAL ACROSS ALL AVAILABLE STOCKS...")
+    # Strategy is intentionally unchanged. The stock universe itself supplies
+    # the cross-sectional reference returns; no external index endpoint is used.
+    candidates = score_universe(stocks, {}, config)
     selected = select_top3(candidates, stocks, config)
 
     metadata = {
         "decision_time": decision_now.isoformat(),
         "data_cutoff": None,
         "latest_stock_candle": latest_stock_ts.isoformat() if latest_stock_ts else None,
-        "latest_index_candle": latest_index_ts.isoformat() if latest_index_ts else None,
         "received_stock_records": len(stocks),
-        "index_series_available": len(indices),
-        "index_context_available": sorted(indices),
+        "expected_universe": config.expected_universe,
         "candidate_count": len(candidates),
         "final_count": len(selected),
-        "stock_endpoints": config.expected_shards,
+        "stock_endpoint": STOCK_ENDPOINT,
         "hard_exit": "13:15 IST",
         "engine_mode": "LATEST_AVAILABLE_DATA",
         "data_quality_layer": "UPSTREAM_AUTHORITY",
         "run_status": "SIGNALS_GENERATED" if selected else "NO_CANDIDATES",
-        "run_reason": "Strategy ranking completed on the available upstream stock universe.",
-        "closed_stock_shards": closed_stock_shards,
-        "failed_stock_shards": failed_stock_shards,
-        "failed_index_endpoints": failed_index_endpoints,
+        "run_reason": "Strategy ranking completed on the single upstream 450-stock snapshot.",
+        "endpoint_error": result.error,
+        "upstream_status": status,
     }
 
     print("[4/4] SURVIVAL SIGNAL — TOP 3")
