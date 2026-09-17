@@ -19,7 +19,7 @@ def main() -> int:
     parser.add_argument(
         "--require-live",
         action="store_true",
-        help="require a live stock universe and exactly 3 selected trades",
+        help="require the complete 450-stock live universe and exactly 3 selected trades",
     )
     args = parser.parse_args()
 
@@ -66,6 +66,13 @@ def main() -> int:
         print(f"Elapsed: {elapsed:.3f}s")
         return 0
 
+    if args.require_live and len(stocks) != config.expected_universe:
+        print(
+            f"RESULT: FAIL - expected {config.expected_universe} parsed stocks, "
+            f"received {len(stocks)}"
+        )
+        return 1
+
     print()
     print("[3/5] SCORING THE ENTIRE AVAILABLE STOCK UNIVERSE...")
     # Strategy is unchanged. No external index/context data is supplied.
@@ -91,6 +98,13 @@ def main() -> int:
         print("RESULT: FAIL - candidate invariants failed")
         for item in invalid[:20]:
             print("  ", item)
+        return 1
+
+    if args.require_live and len(candidates) != config.expected_universe:
+        print(
+            f"RESULT: FAIL - expected {config.expected_universe} candidates, "
+            f"received {len(candidates)}"
+        )
         return 1
 
     print("  Candidate invariants: PASS")
